@@ -1,10 +1,13 @@
 ///
-/// Test bench comparing SortedHeap.h, SortedHeapV2.h and SortedHeapV3.h
+/// Test bench comparing SortedHeap.h and SortedHeapV2.h to V4.h
 /// @details The heaps hold boost::weak_ptr<CSignal>, as in production, so
-/// the heap does not keep signals alive. Each sort method locks both
-/// weak pointers on every comparison and sorts an expired signal to the
-/// top, so it is popped and thrown out. Every element copy and every lock
-/// is an atomic reference count update. Two tests are run:
+/// the heap does not keep signals alive. As in production, the criteria
+/// are sort methods on CSignalPtr in a CSortMethodList, wrapped by
+/// CSignalSort, which locks both weak pointers on every comparison and
+/// sorts an expired signal to the top so it is popped and thrown out.
+/// Every element copy and every lock is an atomic reference count update.
+/// v4::CSortedChangingWeakHeap takes the CSortMethodList directly and
+/// locks each signal once per search instead. Two tests are run:
 ///
 /// Step test (CSortedChangingHeap): a user steps one signal at a time
 /// using tiered criteria: user priority, then next frequency up from the
@@ -16,7 +19,7 @@
 /// signals. Only the popping is timed.
 ///
 /// Drain test (CSortedHeap): fills the unchanging heap and pops every
-/// item. v3::CSortedHeap is the same class as v2::CSortedHeap.
+/// item. v3::CSortedHeap and v4::CSortedHeap are v2::CSortedHeap.
 ///
 /// Build and run (from this directory):
 ///   make
@@ -25,6 +28,7 @@
 #include "../SortedHeap.h"
 #include "../SortedHeapV2.h"
 #include "../SortedHeapV3.h"
+#include "../SortedHeapV4.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,55 +56,97 @@ typedef boost::shared_ptr<CSignal> CSignalPtr;
 typedef boost::weak_ptr<CSignal> CSignalWeakPtr;
 
 /// typedef for smart pointer to a sort method on signals
-typedef boost::shared_ptr< ISortMethod<CSignalWeakPtr> > ISignalSortPtr;
+typedef boost::shared_ptr< ISortMethod<CSignalPtr> > ISignalSortPtr;
 
-static long long comparisons=0; //!< number of LessThan calls
+static long long comparisons=0; //!< number of signal comparisons
 
 // The heaps return the greatest item, so LessThan(lhs, rhs) returns true
 // when rhs should be chosen before lhs.
 
 ///
-/// Base for sort methods on weak pointers to signals
-/// @details locks both sides; an expired signal is greater than any live
-/// one so it comes to the top to be thrown out.
-class CSignalSortMethod : public ISortMethod<CSignalWeakPtr>
+/// List of sort methods on signals that counts comparisons
+class CSignalSortList : public CSortMethodList<CSignalPtr>
 {
 public:
-	virtual bool LessThan(const CSignalWeakPtr& lhs, const CSignalWeakPtr& rhs) const
+	virtual bool LessThan(const CSignalPtr& lhs, const CSignalPtr& rhs) const
 	{
 		++comparisons;
-		CSignalPtr left=lhs.lock();
-		CSignalPtr right=rhs.lock();
-		if(!right)
-		{
-			return(left ? true : false);
-		}
-		if(!left)
+		return(CSortMethodList<CSignalPtr>::LessThan(lhs, rhs));
+	}
+};
+
+///
+/// Base class for signal sorting, as in production
+/// @details locks the weak pointers and calls the smart pointer sort.
+/// An expired signal is greater than any live one so it comes to the top
+/// to be thrown out.
+class CSignalSort : public ISortMethod<CSignalWeakPtr>
+{
+public:
+	virtual ~CSignalSort() {};
+	virtual bool LessThan(const CSignalWeakPtr& lhs, const CSignalWeakPtr& rhs) const
+	{
+		// Lock the weak pointers
+		CSignalPtr smartRhs = rhs.lock();
+		CSignalPtr smartLhs = lhs.lock();
+
+		// If they are equal
+		if (!smartLhs && !smartRhs)
 		{
 			return(false);
 		}
-		return(LessThan(*left, *right));
-	}
+		// if the lhs is null
+		else if (!smartLhs)
+		{
+			return(false);
+		}
+		// if the rhs is null
+		else if (!smartRhs)
+		{
+			return(true);
+		}
+		else
+		{
+			// Call the smart pointer version as the pointers as valid
+			return(mSmartPointerSort->LessThan(smartLhs, smartRhs));
+		}
+	};
 
-	/// Method to implement < operation on live signals
-	/// @param [in] lhs left hand side of operation
-	/// @param [in] rhs right hand side of operation
-	/// @return true if rhs should be chosen before lhs
-	virtual bool LessThan(const CSignal& lhs, const CSignal& rhs) const = 0;
+	void SetSmartPointerSort(const boost::shared_ptr< ISortMethod<CSignalPtr> >& sort)
+	{
+		mSmartPointerSort = sort;
+	};
+
+private:
+	boost::shared_ptr< ISortMethod<CSignalPtr> > mSmartPointerSort;
 };
 
+/// Sets the sorting of a heap of weak pointers to a CSignalSort that
+/// wraps the smart pointer sort
+template< typename Heap >
+void SetSignalSorting(Heap& heap, const ISignalSortPtr& sort)
+{
+	boost::shared_ptr<CSignalSort> signalSort(new CSignalSort());
+	signalSort->SetSmartPointerSort(sort);
+	heap.SetSorting(signalSort);
+}
+
+/// v4::CSortedChangingWeakHeap takes the smart pointer sort directly
+void SetSignalSorting(v4::CSortedChangingWeakHeap<CSignal>& heap, const ISignalSortPtr& sort)
+{
+	heap.SetSorting(sort);
+}
+
 /// Sort by user priority
-class CSortByPriority : public CSignalSortMethod
+class CSortByPriority : public ISortMethod<CSignalPtr>
 {
 public:
 	/// @param [in] newHighestFirst true to choose the highest priority first
 	CSortByPriority(bool newHighestFirst) : highestFirst(newHighestFirst) {}
 
-	using CSignalSortMethod::LessThan;
-
-	virtual bool LessThan(const CSignal& lhs, const CSignal& rhs) const
+	virtual bool LessThan(const CSignalPtr& lhs, const CSignalPtr& rhs) const
 	{
-		return(highestFirst ? (lhs.priority < rhs.priority) : (rhs.priority < lhs.priority));
+		return(highestFirst ? (lhs->priority < rhs->priority) : (rhs->priority < lhs->priority));
 	}
 
 private:
@@ -108,17 +154,15 @@ private:
 };
 
 /// Sort by time of detection
-class CSortByDetectTime : public CSignalSortMethod
+class CSortByDetectTime : public ISortMethod<CSignalPtr>
 {
 public:
 	/// @param [in] newOldestFirst true to choose the oldest detection first
 	CSortByDetectTime(bool newOldestFirst) : oldestFirst(newOldestFirst) {}
 
-	using CSignalSortMethod::LessThan;
-
-	virtual bool LessThan(const CSignal& lhs, const CSignal& rhs) const
+	virtual bool LessThan(const CSignalPtr& lhs, const CSignalPtr& rhs) const
 	{
-		return(oldestFirst ? (rhs.detectTime < lhs.detectTime) : (lhs.detectTime < rhs.detectTime));
+		return(oldestFirst ? (rhs->detectTime < lhs->detectTime) : (lhs->detectTime < rhs->detectTime));
 	}
 
 private:
@@ -128,7 +172,7 @@ private:
 /// Sort by the next frequency in line from the last signal chosen
 /// @details signals at or behind the last frequency come after all
 /// signals ahead of it, so the sweep does not step back to them.
-class CSortByNextFrequency : public CSignalSortMethod
+class CSortByNextFrequency : public ISortMethod<CSignalPtr>
 {
 public:
 	/// @param [in] newUpward true to sweep up in frequency, false for down
@@ -141,12 +185,10 @@ public:
 		lastFrequency=frequency;
 	}
 
-	using CSignalSortMethod::LessThan;
-
-	virtual bool LessThan(const CSignal& lhs, const CSignal& rhs) const
+	virtual bool LessThan(const CSignalPtr& lhs, const CSignalPtr& rhs) const
 	{
 		// a larger distance ahead of the last frequency is chosen later
-		return(Distance(lhs.frequency) > Distance(rhs.frequency));
+		return(Distance(lhs->frequency) > Distance(rhs->frequency));
 	}
 
 private:
@@ -178,13 +220,13 @@ public:
 	CWorld(int numSignals)
 		: generator(12345), nextId(0), now(0.0),
 		nextFrequency(new CSortByNextFrequency(true)),
-		sorting(new CSortMethodList<CSignalWeakPtr>()), thrownOut(0)
+		sorting(new CSignalSortList()), thrownOut(0)
 	{
 		// user priority, then next frequency up, then oldest detection
 		sorting->AddMethod(ISignalSortPtr(new CSortByPriority(true)));
 		sorting->AddMethod(nextFrequency);
 		sorting->AddMethod(ISignalSortPtr(new CSortByDetectTime(true)));
-		heap.SetSorting(sorting);
+		SetSignalSorting(heap, sorting);
 
 		std::vector<CSignalWeakPtr> signals;
 		for(int i=0; i < numSignals; i++)
@@ -267,7 +309,7 @@ private:
 	int nextId; //!< id for the next new signal
 	double now; //!< simulated time in seconds
 	boost::shared_ptr<CSortByNextFrequency> nextFrequency; //!< frequency sweep criteria
-	boost::shared_ptr< CSortMethodList<CSignalWeakPtr> > sorting; //!< tiered criteria
+	boost::shared_ptr<CSignalSortList> sorting; //!< tiered criteria
 	std::vector<CSignalPtr> live; //!< owners of signals in the list, in arrival order
 	Heap heap; //!< heap under test
 
@@ -324,7 +366,7 @@ template< typename Heap >
 SResult RunDrain(int numSignals)
 {
 	// user priority, then oldest detection
-	boost::shared_ptr< CSortMethodList<CSignalWeakPtr> > sorting(new CSortMethodList<CSignalWeakPtr>());
+	boost::shared_ptr<CSignalSortList> sorting(new CSignalSortList());
 	sorting->AddMethod(ISignalSortPtr(new CSortByPriority(true)));
 	sorting->AddMethod(ISignalSortPtr(new CSortByDetectTime(true)));
 
@@ -336,7 +378,8 @@ SResult RunDrain(int numSignals)
 	}
 	std::shuffle(signals.begin(), signals.end(), generator);
 
-	Heap heap(sorting);
+	Heap heap;
+	SetSignalSorting(heap, sorting);
 	heap.AddItems(std::vector<CSignalWeakPtr>(signals.begin(), signals.end()));
 
 	SResult result={0.0, 0.0, 0, 0, std::vector<int>()};
@@ -357,7 +400,7 @@ SResult RunDrain(int numSignals)
 bool Print(const char* name, const SResult& result, const SResult& reference, int count)
 {
 	bool same=(result.order == reference.order);
-	std::printf("  %-26s %10.3f ms/step %10.3f ms max %13lld compares %6lld thrown out %8.1fx  %s\n",
+	std::printf("  %-28s %10.3f ms/step %10.3f ms max %13lld compares %6lld thrown out %8.1fx  %s\n",
 		name, result.ms / count, result.maxMs, result.comparisons, result.thrownOut,
 		reference.ms / (result.ms > 0 ? result.ms : 1e-9),
 		same ? "same signals" : "DIFFERENT signals");
@@ -374,15 +417,17 @@ int main(int argc, char** argv)
 	SResult original=RunSteps< CSortedChangingHeap<CSignalWeakPtr> >(numSignals, steps);
 	SResult stepV2=RunSteps< v2::CSortedChangingHeap<CSignalWeakPtr> >(numSignals, steps);
 	SResult stepV3=RunSteps< v3::CSortedChangingHeap<CSignalWeakPtr> >(numSignals, steps);
+	SResult stepV4=RunSteps< v4::CSortedChangingWeakHeap<CSignal> >(numSignals, steps);
 	allSame=Print("CSortedChangingHeap", original, original, steps) && allSame;
 	allSame=Print("v2::CSortedChangingHeap", stepV2, original, steps) && allSame;
 	allSame=Print("v3::CSortedChangingHeap", stepV3, original, steps) && allSame;
+	allSame=Print("v4::CSortedChangingWeakHeap", stepV4, original, steps) && allSame;
 
 	std::printf("\nDrain test: %d signals (times are for popping every signal)\n", numSignals);
 	SResult drain=RunDrain< CSortedHeap<CSignalWeakPtr> >(numSignals);
 	SResult drainV2=RunDrain< v2::CSortedHeap<CSignalWeakPtr> >(numSignals);
 	allSame=Print("CSortedHeap", drain, drain, 1) && allSame;
-	allSame=Print("v2::CSortedHeap (= v3)", drainV2, drain, 1) && allSame;
+	allSame=Print("v2::CSortedHeap (= v3, v4)", drainV2, drain, 1) && allSame;
 
 	if(!allSame)
 	{
