@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cassert>
+#include <deque>
+#include <iterator>
 #include <vector>
 #include <map>
-#include <heap>
 #include <boost/shared_ptr.hpp>
 #include <boost/function.hpp>
 #include <boost/bind.hpp>
