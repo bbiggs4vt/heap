@@ -1,6 +1,8 @@
 #pragma once
 
 #include <functional>
+#include <memory>
+#include <boost/weak_ptr.hpp>
 #include "SortedHeapV2.h"
 
 ///
@@ -13,16 +15,44 @@
 /// chosen (e.g. next frequency up), so any ordering kept from a previous
 /// call is stale. A linear scan makes fewer comparisons than make_heap,
 /// moves no items, and does not rely on a heap invariant.
+/// When the items are weak pointers, Top also removes every expired
+/// item in one pass first, rather than leaving the sort methods to move
+/// them to the top to be popped and thrown out one search at a time.
 namespace v3
 {
 
 /// unchanging heap is the same as v2
 using v2::CSortedHeap;
 
+namespace detail
+{
+	/// Items that are not weak pointers never expire
+	template< typename T >
+	bool IsExpired(const T&)
+	{
+		return(false);
+	}
+
+	/// Method that returns whether a weak pointer has expired
+	template< typename U >
+	bool IsExpired(const boost::weak_ptr<U>& item)
+	{
+		return(item.expired());
+	}
+
+	/// Method that returns whether a weak pointer has expired
+	template< typename U >
+	bool IsExpired(const std::weak_ptr<U>& item)
+	{
+		return(item.expired());
+	}
+}
+
 ///
 /// Templated class to find the top item of a set of changing items
 /// @details The items in this container can be changing value
 /// thus the top item is found again each time Top or PopTop is called.
+/// If T is a weak pointer, expired items are removed when Top is called.
 template< typename T >
 class CSortedChangingHeap
 {
@@ -108,13 +138,22 @@ public:
 	}
 
 	/// Method to get the top item
-	/// @details finds the top item using the current values of all
-	/// items and the current state of the sorting method. This method
-	/// will not remove the item.
-	/// @return top item
+	/// @details removes expired weak pointers, then finds the top item
+	/// using the current values of all items and the current state of
+	/// the sorting method. This method will not remove the top item.
+	/// An item can still expire after this check, so callers should
+	/// still throw out an item that fails to lock.
+	/// @return top item, or an empty item if every item had expired
 	T Top()
 	{
 		assert(!container.empty());
+
+		RemoveExpired();
+		if(container.empty())
+		{
+			topValid=false;
+			return(T());
+		}
 
 		topIndex=std::max_element(container.begin(), container.end(), std::cref(*this)) - container.begin();
 		topValid=true;
@@ -123,14 +162,17 @@ public:
 	}
 
 	/// Method to get the top item and remove it
-	/// @return top item
+	/// @return top item, or an empty item if every item had expired
 	T PopTop()
 	{
 		// get the value
 		T value = Top();
 
-		// Remove it
-		Pop();
+		// Remove it, unless every item had expired
+		if(topValid)
+		{
+			Pop();
+		}
 
 		return(value);
 	}
@@ -159,8 +201,11 @@ public:
 		// get the value
 		T value = TopNoSort();
 
-		// Remove it
-		Pop();
+		// Remove it, unless every item had expired
+		if(topValid)
+		{
+			Pop();
+		}
 
 		return(value);
 	}
@@ -174,6 +219,10 @@ public:
 		if(!topValid || topIndex >= container.size())
 		{
 			Top();
+			if(!topValid)
+			{
+				return;
+			}
 		}
 
 		// Swap the top item to the back so removing it is cheap
@@ -210,6 +259,13 @@ public:
 	}
 
 private:
+	/// Method to remove expired weak pointers in one pass
+	void RemoveExpired()
+	{
+		container.erase(std::remove_if(container.begin(), container.end(),
+			[](const T& item) { return(detail::IsExpired(item)); }), container.end());
+	}
+
 	HeapContainer container; //<! container of items
 	ISortMethodPtr sorting; //!< sorting method
 	size_t topIndex; //!< index of the top item found by the last Top
