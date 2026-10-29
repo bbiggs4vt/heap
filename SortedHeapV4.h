@@ -29,6 +29,13 @@ using v3::CSortedChangingHeap;
 /// and compares the locked pointers. Only the greatest item so far is
 /// held locked during the search, and PopTopLocked hands it to the caller,
 /// so this class never keeps items alive after a call returns.
+///
+/// An optional filter can be set. It is called once per live item per
+/// search, and filtered items take no part in the comparisons. Filtered
+/// items rank below every unfiltered item: if every live item is
+/// filtered, Top returns one of them, so a caller that checks its own
+/// filter on the top item behaves as it would with the filter as the
+/// first sort criteria. Filtered items stay in the container.
 template< typename U >
 class CSortedChangingWeakHeap
 {
@@ -41,6 +48,9 @@ public:
 
 	/// typedef for smart pointer to the sort method on locked items
 	typedef boost::shared_ptr< ISortMethod<LockedT> > ISortMethodPtr;
+
+	/// typedef of filter, returns true if a locked item is filtered out
+	typedef boost::function<bool (const LockedT&)> FilterFunction;
 
 	/// typedef of container
 	typedef std::vector<T> HeapContainer;
@@ -81,6 +91,14 @@ public:
 	void SetSorting(const ISortMethodPtr& newSorting)
 	{
 		sorting=newSorting;
+		topValid=false;
+	}
+
+	/// Method to set the filter
+	/// @param [in] newFilter filter, or an empty function for no filter
+	void SetFilter(const FilterFunction& newFilter)
+	{
+		filter=newFilter;
 		topValid=false;
 	}
 
@@ -252,9 +270,11 @@ private:
 		assert(sorting);
 
 		// One pass: lock each item once, remove the ones that have
-		// expired, and keep the greatest so far locked. Same result as
-		// std::max_element, the first greatest item.
+		// expired, skip filtered ones, and keep the greatest so far
+		// locked. Same result as std::max_element, the first greatest item.
 		LockedT top;
+		size_t filteredIndex=0;
+		bool anyFiltered=false;
 		size_t kept=0;
 		for(size_t i=0; i < container.size(); i++)
 		{
@@ -268,7 +288,16 @@ private:
 			{
 				container[kept]=container[i];
 			}
-			if(!top || sorting->LessThan(top, item))
+			if(filter && filter(item))
+			{
+				// remember the first filtered item in case all are
+				if(!anyFiltered)
+				{
+					filteredIndex=kept;
+					anyFiltered=true;
+				}
+			}
+			else if(!top || sorting->LessThan(top, item))
 			{
 				top.swap(item);
 				topIndex=kept;
@@ -277,12 +306,20 @@ private:
 		}
 		container.resize(kept);
 
+		// every live item is filtered, return one of them
+		if(!top && anyFiltered)
+		{
+			topIndex=filteredIndex;
+			top=container[topIndex].lock();
+		}
+
 		topValid=(top ? true : false);
 		return(top);
 	}
 
 	HeapContainer container; //<! container of items
 	ISortMethodPtr sorting; //!< sorting method on locked items
+	FilterFunction filter; //!< filter, empty for none
 	size_t topIndex; //!< index of the top item found by the last Top
 	bool topValid; //!< true if topIndex is valid
 };
